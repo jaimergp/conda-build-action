@@ -1,0 +1,205 @@
+name: conda-build-action
+description: GitHub Actions action to build conda packages using conda-build
+author: Jaime Rodríguez-Guerra
+branding:
+  icon: package
+  color: yellow
+inputs:
+  conda-build-version:
+    description: Version of conda-build to use
+    required: false
+    default: '*'
+  recipe-dir:
+    description: Path to the directory containing the meta.yaml recipe
+    required: true
+    default: recipe
+  upload-artifact:
+    description: Whether to upload the built packages as a build artifact to GH
+    required: false
+    default: 'true'
+  artifact-name:
+    description: If upload-artifact is true, the name of such artifact
+    required: false
+    default: 'conda-artifacts'
+  upload-anaconda:
+    description: Whether to upload the built packages to Anaconda.org
+    required: false
+    default: 'false'
+  anaconda-org-token:
+    description: Anaconda.org token
+    required: false
+    default: ''
+  anaconda-org-channel:
+    description: Anaconda.org channel name
+    required: false
+    default: ''
+  anaconda-org-label:
+    description: Anaconda.org channel label
+    required: false
+    default: ''
+  build-args:
+    description: Arguments to pass to conda-build
+    required: false
+    default: ''
+  default-channel:
+    description: |
+      Default channel(s) to configure conda with (usually, conda-forge or defaults).
+      Use a comma-separated list if more than one is needed (e.g. `conda-forge,defaults`).
+    required: false
+    default: 'conda-forge'
+  inspect-packages:
+    description: Whether to analyze the built packages and report the inspection results
+    required: false
+    default: 'true'
+runs:
+  using: composite
+  steps:
+    - name: Create condarc
+      shell: bash
+      run: |
+        echo "channels: [${{ inputs.default-channel }}]" > .condarc
+    - name: Setup conda
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        condarc-file: .condarc
+        run-post: false  # skip post cleanup
+        # conda not preinstalled in arm64 runners
+        miniconda-version: ${{ matrix.default-channel == 'defaults' && 'latest' || null }}
+        miniforge-version: ${{ matrix.default-channel != 'defaults' && 'latest' || null }}
+        architecture: ${{ runner.arch }}
+    - name: Install conda-build
+      shell: bash -el {0}
+      run: |
+        conda install --yes \
+          "conda-build=${{ inputs.conda-buld-version }}" \
+          anaconda-client \
+          conda-package-handling \
+          openssl \
+          ${{ runner.os == 'Windows' && 'm2-coreutils' || 'coreutils' }} \
+          ${{ runner.os == 'Windows' && '__win' || 'tree' }} \
+          ${{ runner.os == 'Windows' && 'm2w64-jq' || 'jq' }}
+        conda install --yes git
+    - name: Create output directory
+      shell: bash -el {0}
+      run: |
+        mkdir -p "${{ runner.temp }}/bld"
+        echo "conda_build_output=${{ runner.temp }}/bld" >> $GITHUB_OUTPUT
+        echo "CONDA_BLD_PATH=${{ runner.temp }}/bld" >> $GITHUB_ENV
+    - name: Debugging information
+      shell: bash -el {0}
+      run: |
+        echo "+ conda info"
+        conda info
+        echo "+ conda config --show-sources"
+        conda config --show-sources
+        echo "+ conda list -n base"
+        conda list -n base
+        echo "+ conda list"
+        conda list
+    - name: Build conda package(s)
+      shell: bash -el {0}
+      run: |
+        conda-build ${{ inputs.build-args }} "${{ inputs.recipe-dir }}"
+    - name: Inspect conda package(s)
+      shell: bash -el {0}
+      if: ${{ inputs.inspect-packages == 'true' }}
+      run: |
+        # Inspect conda packages
+        set -euo pipefail
+        shopt -s nullglob
+
+        cd "$CONDA_BLD_PATH"
+        pkgs=(**/*.tar.bz2 **/*.conda)
+
+        function details_header {
+          echo -n "------------"
+          printf "%0.s-" $(seq 1 ${#1})
+          echo
+          echo "Details for $1"
+          echo -n "------------"
+          printf "%0.s-" $(seq 1 ${#1})
+          echo
+        }
+
+        function print_tree {
+          # TODO: Package msys2 tree for feature parity on Windows
+          case "$(uname -s)" in
+            Darwin*|Linux*)
+              tree -aph --du
+            ;;
+            CYGWIN*|MINGW*|MINGW32*|MSYS*)
+              echo "tree /F" | cmd
+            ;;
+          esac
+        }
+
+        if [[ ${#pkgs[@]} == 0 ]]; then
+          echo "No packages were built!"
+          exit 1
+        fi
+        echo "Built these packages:"
+        ls -alh ${pkgs[@]}
+
+        tmp_workspace="${{ runner.temp }}/inspect-conda-pkgs"
+        mkdir -p "$tmp_workspace"
+        for pkg in ${pkgs[@]}; do
+          details_header $(realpath --relative-to="$CONDA_BLD_PATH" "$pkg")
+          if [[ $pkg = broken/* ]]; then
+            echo "! Package is broken. Skipping analysis..."
+            continue
+          fi
+          echo "MD5:    $(openssl md5 "$pkg" | awk '{print $NF}')"
+          echo "SHA256: $(openssl sha256 "$pkg" | awk '{print $NF}')"
+          if cph x --prefix "$tmp_workspace" --dest $(basename "$pkg") $pkg; then
+            extractdir="$tmp_workspace/$(basename "$pkg")"
+            for meta in index hash_input run_exports; do
+              if [ -f "$extractdir/info/$meta.json" ]; then
+                echo "-- Metadata: $meta.json"
+                jq . "$extractdir/info/$meta.json"
+              fi
+            done
+            echo "-- Contents"
+            (cd "$extractdir" && print_tree)
+          else
+            echo "Could not extract $pkg!"
+            exit 1
+          fi
+        done
+    - name: Upload builds to GH artifacts
+      uses: actions/upload-artifact@v4
+      if: ${{ inputs.upload-artifact == 'true' }}
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: |
+          ${{ runner.temp }}/bld/**/*.tar.bz2
+          ${{ runner.temp }}/bld/**/*.conda
+    - name: Upload builds to Anaconda.org
+      if: ${{ inputs.upload-anaconda == 'true' }}
+      shell: bash -el {0}
+      run: |
+        shopt -s nullglob
+        if [ "${{ inputs.anaconda-org-label }}" != "" ]; then
+          label_args="--label=${{ inputs.anaconda-org-label }}"
+          dash_c_value="${{ inputs.anaconda-org-channel }}/label/${{ inputs.anaconda-org-label }}"
+        else
+          label_args=""
+          dash_c_value="${{ inputs.anaconda-org-channel }}"
+        fi
+        pkgs=("${CONDA_BLD_PATH}"/**/*.tar.bz2 "${CONDA_BLD_PATH}"/**/*.conda)
+        if [[ ${#pkgs[@]} == 0 ]]; then
+          echo "::error:: No packages to upload!"
+          exit
+        fi
+        anaconda \
+          --token="${{ inputs.anaconda-org-token }}" \
+          upload \
+          --force \
+          --register \
+          --no-progress \
+          --user="${{ inputs.anaconda-org-channel }}" \
+          $label_args \
+          ${pkgs[@]}
+        echo "Uploaded the following files:"
+        basename -a ${pkgs[@]}
+        echo "Use this command to try out the builds:"
+        echo "conda create -n test -c $dash_c_value YOUR_PACKAGE(S)"

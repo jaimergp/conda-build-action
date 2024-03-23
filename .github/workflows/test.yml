@@ -1,0 +1,30 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: Test action
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        recipe:
+          - conda-store
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - macos-14
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          recipe-dir: test/${{ matrix.recipe }}
+          artifact-name: package-${{ matrix.recipe }}-${{ matrix.os }}
